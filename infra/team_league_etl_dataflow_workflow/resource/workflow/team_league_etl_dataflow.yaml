@@ -1,0 +1,108 @@
+main:
+  params: [ workflowConfig ]
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - location_id: "global"
+          - location: ${sys.get_env("GOOGLE_CLOUD_LOCATION")}
+          - workflow_service_account_name: ${sys.get_env("GOOGLE_CLOUD_SERVICE_ACCOUNT_NAME")}
+          - workflow_execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+    - launchDataflowTemplate:
+        call: LaunchDataflowTemplate
+        args:
+          project_id: ${project_id}
+          location: ${location}
+          workflowExecutionId: ${workflow_execution_id}
+          workflowConfig: ${workflowConfig}
+        result: job
+    - waitForDataflowJobDone:
+        call: DataflowWaitUntilStatus
+        args:
+          project_id: ${project_id}
+          location: ${location}
+          jobId: ${job.id}
+          status: "JOB_STATE_DONE"
+        result: jobStatus
+    - copyProcessedFilesToColdBucket:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: ${project_id}
+          parent: ${"projects/" + project_id + "/locations/" + location_id}
+          body:
+            serviceAccount: ${workflow_service_account_name}
+            options:
+              logging: CLOUD_LOGGING_ONLY
+            steps:
+              - name: gcr.io/google.com/cloudsdktool/cloud-sdk:455.0.0-slim
+                script: ${"gsutil cp " + workflowConfig.team_stats_raw_files_hot_source_uri + " " + workflowConfig.team_stats_raw_files_cold_destination_uri}
+        result: resultCloudBuildCopy
+    - returnResult:
+        return: ${"JobId :"+job.id+" Status :"+jobStatus}
+
+LaunchDataflowTemplate:
+  params: [ project_id, location, workflowConfig, workflowExecutionId ]
+  steps:
+    - launch:
+        call: googleapis.dataflow.v1b3.projects.locations.flexTemplates.launch
+        args:
+          location: ${location}
+          projectId: ${project_id}
+          body:
+            launchParameter:
+              jobName: ${workflowConfig.team_stat_dataflow_job.job_name+"-"+workflowExecutionId}
+              containerSpecGcsPath: ${workflowConfig.team_stat_dataflow_job.flex_template_spec_gcs_file_path}
+              environment:
+                serviceAccountEmail: ${workflowConfig.team_stat_dataflow_job.service_account_email}
+                stagingLocation: ${workflowConfig.team_stat_dataflow_job.staging_location}
+                tempLocation: ${workflowConfig.team_stat_dataflow_job.temp_location}
+              parameters:
+                project_id: ${project_id}
+                input_json_file: ${workflowConfig.team_stat_dataflow_job.input_json_file}
+                team_league_dataset: ${workflowConfig.team_stat_dataflow_job.team_league_dataset}
+                team_stats_table: ${workflowConfig.team_stat_dataflow_job.team_stats_table}
+        result: dataflowJobResponse
+        next: jobCreated
+    - jobCreated:
+        return: ${dataflowJobResponse.job}
+
+DataflowWaitUntilStatus:
+  params: [ project_id, location, jobId, status ]
+  steps:
+    - init:
+        assign:
+          - currentStatus: ""
+          - failureStatuses: [ "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_UPDATED", "JOB_STATE_DRAINED" ]
+    - check_condition:
+        switch:
+          - condition: ${currentStatus in failureStatuses}
+            next: exit_fail
+          - condition: ${currentStatus != status}
+            next: iterate
+        next: exit_success
+    - iterate:
+        steps:
+          - sleep30s:
+              call: sys.sleep
+              args:
+                seconds: 20
+          - getJob:
+              call: http.get
+              args:
+                url: ${"https://dataflow.googleapis.com/v1b3/projects/"+project_id+"/locations/"+location+"/jobs/"+jobId}
+                auth:
+                  type: OAuth2
+              result: getJobResponse
+          - getStatus:
+              assign:
+                - currentStatus: ${getJobResponse.body.currentState}
+          - log:
+              call: sys.log
+              args:
+                text: ${"Current job status="+currentStatus}
+                severity: "INFO"
+        next: check_condition
+    - exit_success:
+        return: ${currentStatus}
+    - exit_fail:
+        raise: ${"Job in unexpected terminal status "+currentStatus}
