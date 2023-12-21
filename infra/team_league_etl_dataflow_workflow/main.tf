@@ -24,11 +24,11 @@ resource "google_cloud_scheduler_job" "job" {
   }
 }
 
-resource "google_workflows_workflow" "example" {
+resource "google_workflows_workflow" "workflow_etl_team_league_dataflow" {
   project         = var.project_id
   region          = var.location
   name            = var.workflow_name
-  description     = "Workflow for team league ELT"
+  description     = "Workflow for team league ETL"
   service_account = var.workflow_sa
   source_contents = local.team_league_workflow_yaml_as_string
 }
